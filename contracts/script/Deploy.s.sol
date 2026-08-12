@@ -6,7 +6,7 @@ import {LiquidationBot} from "../src/LiquidationBot.sol";
 
 contract Deploy is Script {
     function run() external {
-        uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
+         deployerPrivateKey = vm.envUint("PRIVATE_KEY");
         address addressesProvider = vm.envAddress("AAVE_ADDRESSES_PROVIDER");
         address balancerVault = vm.envAddress("BALANCER_VAULT");
 
