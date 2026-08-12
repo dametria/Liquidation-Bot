@@ -11,20 +11,15 @@ Capital-efficient liquidation bot that:
 
 All steps are atomic in a single transaction. Only gas is required.
 
-## Location
-
-```
-/home/workdir/artifacts/liquidation-bot/
-```
-
 ## Layout
 
 ```
-liquidation-bot/
+Liquidation-Bot/
 ├── contracts/                  # Foundry
 │   ├── src/LiquidationBot.sol  # Core executor
 │   ├── script/Deploy.s.sol
-│   └── foundry.toml
+│   ├── foundry.toml
+│   └── remappings.txt
 ├── analyzer-python/
 │   └── src/scanner.py          # HF checks + profit estimate
 ├── executor-node/
@@ -36,29 +31,69 @@ liquidation-bot/
 
 ## Quick Start
 
+### 1. Install tools
+
 ```bash
-# Install
+# Foundry
+curl -L https://foundry.paradigm.xyz | bash
 foundryup
+
+# Node
 cd executor-node && npm i && cd ..
+
+# Python
 cd analyzer-python && pip install -r requirements.txt && cd ..
+```
 
-# Config
-cp .env.example .env
-# set PRIVATE_KEY, RPC_URL, AAVE_ADDRESSES_PROVIDER, BALANCER_VAULT
+### 2. Install Solidity dependencies (required)
 
-# Deploy
+```bash
 cd contracts
+
+# Install the three libraries the contract needs
 forge install foundry-rs/forge-std OpenZeppelin/openzeppelin-contracts aave/aave-v3-core --no-commit
+
+# Verify the Aave interface is present
+ls lib/aave-v3-core/contracts/flashloan/interfaces/IFlashLoanSimpleReceiver.sol
+```
+
+If the `ls` command succeeds, the import error is fixed.
+
+### 3. Config
+
+```bash
+cp .env.example .env
+# Edit PRIVATE_KEY, RPC_URL, AAVE_ADDRESSES_PROVIDER, BALANCER_VAULT
+```
+
+### 4. Build & Deploy
+
+```bash
+cd contracts
+forge build          # should succeed after the install step above
+
 forge script script/Deploy.s.sol:Deploy \
   --rpc-url $RPC_URL \
   --broadcast \
   --private-key $PRIVATE_KEY \
   -vvvv
-# → copy printed address into .env as LIQUIDATION_BOT
+```
 
-# Run
+Copy the printed `LiquidationBot` address into `.env` as `LIQUIDATION_BOT`.
+
+### 5. Run the bot
+
+```bash
 cd executor-node && npm run dev
 ```
+
+## Common error
+
+```
+Source "@aave/core-v3/contracts/flashloan/interfaces/IFlashLoanSimpleReceiver.sol" not found
+```
+
+→ You skipped the `forge install ... aave/aave-v3-core` step. Run it from the `contracts/` directory.
 
 ## Flow
 
