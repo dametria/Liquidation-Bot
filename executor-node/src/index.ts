@@ -96,7 +96,7 @@ async function main() {
   console.log(`Found ${opps.length} candidate opportunities`);
 
   for (const opp of opps) {
-    if (opp.estimated_profit_usd < Number(process.env.MIN_PROFIT_USD || "5")) {
+    if (opp.estimated_profit_usd < Number(process.env.MIN_PROFIT_USD || "3")) {
       console.log(`Skip ${opp.user} – profit $${opp.estimated_profit_usd.toFixed(2)}`);
       continue;
     }

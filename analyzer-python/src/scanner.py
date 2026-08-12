@@ -28,7 +28,7 @@ AAVE_ORACLE = Web3.to_checksum_address(
     os.getenv("AAVE_ORACLE", "0xb56c2F0B653B2e0b10C9b928C8580Ac5Df78C934")
 )
 MIN_DEBT_USD = Decimal(os.getenv("MIN_DEBT_USD", "50"))
-MIN_PROFIT_USD = Decimal(os.getenv("MIN_PROFIT_USD", "5"))
+MIN_PROFIT_USD = Decimal(os.getenv("MIN_PROFIT_USD", "3"))
 CLOSE_FACTOR = Decimal("0.5")
 FLASH_LOAN_FEE_BPS = Decimal("5")
 GAS_PRICE_GWEI = Decimal(os.getenv("GAS_PRICE_GWEI", "0.1"))
