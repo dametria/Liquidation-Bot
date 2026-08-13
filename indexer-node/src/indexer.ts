@@ -1,9 +1,10 @@
 /**
  * Aave V3 Borrower Event Indexer (production-hardened)
  *
- * If you see 400 Bad Request even on small chunks (e.g. 10–50 blocks),
- * the RPC is rate-limiting or rejecting eth_getLogs. Switch to a paid
- * endpoint (Alchemy, QuickNode, Infura, LlamaRPC, etc.).
+ * .env is loaded from (first found):
+ *   1) process.cwd()/.env
+ *   2) project root (../.env from indexer-node)
+ *   3) ../../.env from src/
  */
 
 import { config } from "dotenv";
@@ -15,11 +16,32 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-config({ path: path.resolve(__dirname, "../../.env") });
+// ─── Load .env from several likely locations ──────────────────
+const envCandidates = [
+  path.resolve(process.cwd(), ".env"),
+  path.resolve(process.cwd(), "../.env"),
+  path.resolve(__dirname, "../../.env"),
+  path.resolve(__dirname, "../../../.env"),
+  path.resolve(__dirname, "../.env"),
+];
 
-const RPC_URL = process.env.RPC_URL || "https://arb1.arbitrum.io/rpc";
+let loadedEnvPath: string | null = null;
+for (const p of envCandidates) {
+  if (fs.existsSync(p)) {
+    const result = config({ path: p });
+    if (!result.error) {
+      loadedEnvPath = p;
+      break;
+    }
+  }
+}
+if (!loadedEnvPath) {
+  config(); // fallback: default dotenv behavior
+}
+
+const RPC_URL = (process.env.RPC_URL || "https://arb1.arbitrum.io/rpc").trim();
 const AAVE_POOL = ethers.getAddress(
-  process.env.AAVE_POOL || "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
+  (process.env.AAVE_POOL || "0x794a61358D6845594F94dc1DB02A252b5b4814aD").trim()
 );
 const USERS_FILE =
   process.env.USERS_FILE ||
@@ -50,6 +72,13 @@ function log(level: LogLevel, msg: string, extra?: Record<string, unknown>) {
   if (LEVELS[level] < LEVELS[LOG_LEVEL]) return;
   const line = { ts: new Date().toISOString(), level, msg, ...extra };
   (level === "error" ? console.error : console.log)(JSON.stringify(line));
+}
+
+function redactRpc(url: string): string {
+  return url
+    .replace(/\/v2\/[\w-]+/g, "/v2/***")
+    .replace(/\/v3\/[\w-]+/g, "/v3/***")
+    .replace(/[?&]apikey=[^&]+/gi, "apikey=***");
 }
 
 const borrowers = new Set<string>();
@@ -189,7 +218,6 @@ async function withRetry<T>(
       return await fn();
     } catch (err: any) {
       lastErr = err;
-      // Don't spin on range/rate-limit errors — caller will shrink or back off
       if (isRangeLimitError(err)) throw err;
       if (attempt === maxRetries) break;
       const delay = Math.min(30_000, 500 * Math.pow(2, attempt));
@@ -232,13 +260,10 @@ async function backfill(provider: ethers.Provider) {
     toBlock: latest,
     span: latest - fromBlock + 1,
     chunk: INITIAL_CHUNK,
-    rpc: RPC_URL.includes("arbitrum.io") ? "public-arbitrum (often rate-limits getLogs)" : "custom",
   });
 
   if (RPC_URL.includes("arb1.arbitrum.io") || RPC_URL.includes("arbitrum.io/rpc")) {
-    log("warn", "Public Arbitrum RPC frequently returns 400 on eth_getLogs. Prefer Alchemy/QuickNode/LlamaRPC.", {
-      hint: "Set RPC_URL in .env to a paid or higher-limit endpoint",
-    });
+    log("warn", "Still using public Arbitrum RPC — eth_getLogs often returns 400. Set RPC_URL to Alchemy/QuickNode.");
   }
 
   let chunk = INITIAL_CHUNK;
@@ -287,21 +312,21 @@ async function backfill(provider: ethers.Provider) {
       const rangeErr = isRangeLimitError(err);
 
       if (rangeErr && chunk <= Math.max(MIN_CHUNK, 50)) {
-        // Tiny range still failing → rate limit / RPC ban, not range size
         rateLimitStrikes++;
         const backoff = Math.min(120_000, 5_000 * Math.pow(2, Math.min(rateLimitStrikes, 5)));
-        log("warn", "RPC rejecting even small getLogs ranges — backing off (likely rate limit)", {
+        log("warn", "RPC rejecting small getLogs ranges — backing off", {
           start,
           end,
           chunk,
           strike: rateLimitStrikes,
           backoffMs: backoff,
           error: msg,
-          tip: "Switch RPC_URL to Alchemy, QuickNode, Infura, or ankr",
+          rpc: redactRpc(RPC_URL),
+          tip: "Confirm .env RPC_URL is loaded (see startup log envFile)",
         });
 
         if (rateLimitStrikes >= 8) {
-          log("error", "Too many rate-limit responses. Saving progress and exiting so you can change RPC.", {
+          log("error", "Too many rate-limit responses. Saving and exiting.", {
             lastProcessedBlock,
             borrowers: borrowers.size,
           });
@@ -311,7 +336,6 @@ async function backfill(provider: ethers.Provider) {
         }
 
         await sleep(backoff);
-        // Do not shrink below MIN_CHUNK; do not advance start
         chunk = Math.max(MIN_CHUNK, Math.min(chunk, 50));
         continue;
       }
@@ -518,12 +542,22 @@ async function main() {
   setupShutdown();
 
   log("info", "Aave V3 Borrower Indexer starting", {
-    rpc: RPC_URL.replace(/\/v2\/[\w-]+/, "/v2/***"),
+    envFile: loadedEnvPath || "(none found — using process.env / defaults)",
+    rpc: redactRpc(RPC_URL),
     pool: AAVE_POOL,
     lookback: LOOKBACK,
     chunk: INITIAL_CHUNK,
     backfillOnly: BACKFILL_ONLY,
+    cwd: process.cwd(),
   });
+
+  if (!loadedEnvPath) {
+    log("warn", "No .env file found. Put RPC_URL in project-root .env or export it in the shell.");
+  }
+
+  if (RPC_URL.includes("arbitrum.io")) {
+    log("warn", "RPC still looks like the public endpoint. Your Alchemy URL may not be loaded.");
+  }
 
   loadExisting();
 
