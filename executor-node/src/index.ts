@@ -11,7 +11,7 @@ import { spawn } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 
-config({ path: path.resolve(__dirname, "../../.env") });
+config({ path: path.resolve(".env") });
 
 const BOT_ABI = [
   "function liquidate((address collateralAsset,address debtAsset,address user,uint256 debtToCover,address swapRouter,uint24 poolFee,uint256 minCollateralOut,uint256 minDebtOutAfterSwap,bool useBalancer) params) external",
