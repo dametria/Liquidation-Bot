@@ -1,5 +1,6 @@
 /**
  * Aave V3 Borrower Event Indexer (production-hardened)
+ * Writes borrowers to <project-root>/shared/users.json
  */
 
 import { config } from "dotenv";
@@ -11,12 +12,31 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+/** Project root = directory that contains indexer-node/ (and usually shared/). */
+function findProjectRoot(): string {
+  const candidates = [
+    path.resolve(__dirname, "../.."), // src/ -> indexer-node -> root
+    path.resolve(process.cwd(), ".."), // cwd = indexer-node
+    process.cwd(), // cwd = root
+  ];
+  for (const c of candidates) {
+    if (
+      fs.existsSync(path.join(c, "indexer-node")) ||
+      fs.existsSync(path.join(c, "executor-node")) ||
+      fs.existsSync(path.join(c, "contracts"))
+    ) {
+      return c;
+    }
+  }
+  return path.resolve(__dirname, "../..");
+}
+
+const PROJECT_ROOT = findProjectRoot();
+
 const envCandidates = [
+  path.join(PROJECT_ROOT, ".env"),
   path.resolve(process.cwd(), ".env"),
   path.resolve(process.cwd(), "../.env"),
-  path.resolve(__dirname, "../../.env"),
-  path.resolve(__dirname, "../../../.env"),
-  path.resolve(__dirname, "../.env"),
 ];
 
 let loadedEnvPath: string | null = null;
@@ -31,19 +51,22 @@ for (const p of envCandidates) {
 }
 if (!loadedEnvPath) config();
 
+function resolveFromRoot(p: string | undefined, fallbackRel: string): string {
+  if (!p || !p.trim()) return path.join(PROJECT_ROOT, fallbackRel);
+  if (path.isAbsolute(p)) return p;
+  // Relative paths in .env are always vs project root (not cwd)
+  return path.resolve(PROJECT_ROOT, p);
+}
+
 const RPC_URL = (process.env.RPC_URL || "https://arb1.arbitrum.io/rpc").trim();
 const AAVE_POOL = ethers.getAddress(
   (process.env.AAVE_POOL || "0x794a61358D6845594F94dc1DB02A252b5b4814aD").trim()
 );
 
-// Prefer cwd-relative shared/ so the file is easy to find from project root
-const USERS_FILE = path.resolve(
-  process.env.USERS_FILE ||
-    path.resolve(process.cwd(), "../shared/users.json")
-);
-const CHECKPOINT_FILE = path.resolve(
-  process.env.INDEXER_CHECKPOINT_FILE ||
-    path.resolve(process.cwd(), "../shared/indexer-checkpoint.json")
+const USERS_FILE = resolveFromRoot(process.env.USERS_FILE, "shared/users.json");
+const CHECKPOINT_FILE = resolveFromRoot(
+  process.env.INDEXER_CHECKPOINT_FILE,
+  "shared/indexer-checkpoint.json"
 );
 
 const LOOKBACK = Number(process.env.INDEXER_LOOKBACK_BLOCKS || "100000");
@@ -95,6 +118,40 @@ function atomicWrite(filePath: string, data: string) {
 }
 
 function loadExisting() {
+  // Also migrate from legacy indexer-node/shared/ if present
+  const legacy = path.join(PROJECT_ROOT, "indexer-node", "shared", "users.json");
+  if (!fs.existsSync(USERS_FILE) && fs.existsSync(legacy)) {
+    try {
+      fs.mkdirSync(path.dirname(USERS_FILE), { recursive: true });
+      fs.copyFileSync(legacy, USERS_FILE);
+      log("info", "Migrated users.json from indexer-node/shared/ to project shared/", {
+        from: legacy,
+        to: USERS_FILE,
+      });
+    } catch (e: any) {
+      log("warn", "Could not migrate legacy users.json", { error: e.message });
+    }
+  }
+
+  const legacyCp = path.join(
+    PROJECT_ROOT,
+    "indexer-node",
+    "shared",
+    "indexer-checkpoint.json"
+  );
+  if (!fs.existsSync(CHECKPOINT_FILE) && fs.existsSync(legacyCp)) {
+    try {
+      fs.mkdirSync(path.dirname(CHECKPOINT_FILE), { recursive: true });
+      fs.copyFileSync(legacyCp, CHECKPOINT_FILE);
+      log("info", "Migrated checkpoint to project shared/", {
+        from: legacyCp,
+        to: CHECKPOINT_FILE,
+      });
+    } catch {
+      /* ignore */
+    }
+  }
+
   try {
     if (fs.existsSync(USERS_FILE)) {
       const raw = JSON.parse(fs.readFileSync(USERS_FILE, "utf8"));
@@ -111,7 +168,7 @@ function loadExisting() {
       }
     }
   } catch (e: any) {
-    log("warn", "Failed to load users.json, starting fresh", { error: e.message });
+    log("warn", "Failed to load users.json", { error: e.message });
   }
 
   try {
@@ -130,6 +187,7 @@ function loadExisting() {
     lastProcessedBlock,
     usersFile: USERS_FILE,
     checkpointFile: CHECKPOINT_FILE,
+    projectRoot: PROJECT_ROOT,
   });
 }
 
@@ -141,15 +199,9 @@ function saveUsers(force = false) {
     atomicWrite(USERS_FILE, JSON.stringify(list, null, 2) + "\n");
     dirtyCount = 0;
     lastSave = Date.now();
-    log("info", "Saved users.json", {
-      count: list.length,
-      path: USERS_FILE,
-    });
+    log("info", "Saved users.json", { count: list.length, path: USERS_FILE });
   } catch (e: any) {
-    log("error", "Failed to save users.json", {
-      error: e.message,
-      path: USERS_FILE,
-    });
+    log("error", "Failed to save users.json", { error: e.message, path: USERS_FILE });
   }
 }
 
@@ -188,11 +240,9 @@ function addBorrower(addr: string | undefined | null) {
   }
 }
 
-/** Pull borrower addresses from an ethers v6 event (Result or plain object). */
 function extractBorrowersFromEvent(ev: any) {
   const args = ev?.args;
   if (!args) return;
-  // Named access
   addBorrower(args.onBehalfOf ?? args[2]);
   addBorrower(args.user ?? args[1]);
 }
@@ -209,13 +259,11 @@ function isRangeLimitError(err: any): boolean {
     msg.includes("block range") ||
     msg.includes("query returned more") ||
     msg.includes("response size") ||
-    msg.includes("log response size") ||
     msg.includes("exceed") ||
     msg.includes("too many") ||
     msg.includes("limit exceeded") ||
     msg.includes("rate limit") ||
-    msg.includes("429") ||
-    (msg.includes("eth_getlogs") && msg.includes("limited"))
+    msg.includes("429")
   );
 }
 
@@ -289,9 +337,7 @@ async function backfill(provider: ethers.Provider) {
         2
       );
 
-      for (const ev of events) {
-        extractBorrowersFromEvent(ev);
-      }
+      for (const ev of events) extractBorrowersFromEvent(ev);
 
       processed += events.length;
       totalEvents += events.length;
@@ -311,7 +357,6 @@ async function backfill(provider: ethers.Provider) {
       if (chunk < INITIAL_CHUNK) {
         chunk = Math.min(INITIAL_CHUNK, Math.max(chunk + 1, Math.floor(chunk * 1.2)));
       }
-
       start = end + 1;
     } catch (err: any) {
       const msg = err.shortMessage || err.message || "";
@@ -329,11 +374,6 @@ async function backfill(provider: ethers.Provider) {
           error: msg,
         });
         if (rateLimitStrikes >= 10) {
-          log("error", "Too many RPC errors. Saving and exiting.", {
-            lastProcessedBlock,
-            borrowers: borrowers.size,
-            usersFile: USERS_FILE,
-          });
           saveUsers(true);
           process.exit(2);
         }
@@ -404,13 +444,10 @@ async function startWsLive() {
 
     const websocket = (wsProvider as any).websocket;
     if (websocket && typeof websocket.on === "function") {
-      websocket.on("close", () => {
-        log("warn", "WebSocket closed, will reconnect");
-        scheduleReconnect();
-      });
-      websocket.on("error", (err: Error) => {
-        log("warn", "WebSocket error", { error: err.message });
-      });
+      websocket.on("close", () => scheduleReconnect());
+      websocket.on("error", (err: Error) =>
+        log("warn", "WebSocket error", { error: err.message })
+      );
     }
 
     reconnectAttempt = 0;
@@ -522,13 +559,13 @@ async function main() {
   setupShutdown();
 
   log("info", "Aave V3 Borrower Indexer starting", {
+    projectRoot: PROJECT_ROOT,
     envFile: loadedEnvPath || "(none found)",
     rpc: redactRpc(RPC_URL),
     pool: AAVE_POOL,
     lookback: LOOKBACK,
     chunk: INITIAL_CHUNK,
     backfillOnly: BACKFILL_ONLY,
-    cwd: process.cwd(),
     usersFile: USERS_FILE,
   });
 
@@ -553,7 +590,7 @@ async function main() {
       await startHttpPolling();
     }
   } else {
-    log("info", "RPC is HTTP — using polling (use wss:// URL for WebSocket)");
+    log("info", "RPC is HTTP — using polling (use wss:// for WebSocket)");
     await startHttpPolling();
   }
 

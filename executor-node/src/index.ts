@@ -1,8 +1,6 @@
 /**
  * Liquidation Bot Executor
- * - Loads opportunities from Python scanner
- * - Simulates via callStatic
- * - Submits liquidate() – profit auto-sent to deployer by the contract
+ * Reads <project-root>/shared/users.json (same file the indexer writes)
  */
 
 import { config } from "dotenv";
@@ -15,8 +13,34 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Load .env from project root (two levels up from executor-node/src)
-config({ path: path.resolve(__dirname, "../../.env") });
+function findProjectRoot(): string {
+  const candidates = [
+    path.resolve(__dirname, "../.."),
+    path.resolve(process.cwd(), ".."),
+    process.cwd(),
+  ];
+  for (const c of candidates) {
+    if (
+      fs.existsSync(path.join(c, "indexer-node")) ||
+      fs.existsSync(path.join(c, "executor-node")) ||
+      fs.existsSync(path.join(c, "contracts"))
+    ) {
+      return c;
+    }
+  }
+  return path.resolve(__dirname, "../..");
+}
+
+const PROJECT_ROOT = findProjectRoot();
+
+config({ path: path.join(PROJECT_ROOT, ".env") });
+config({ path: path.resolve(process.cwd(), ".env") });
+
+function resolveFromRoot(p: string | undefined, fallbackRel: string): string {
+  if (!p || !p.trim()) return path.join(PROJECT_ROOT, fallbackRel);
+  if (path.isAbsolute(p)) return p;
+  return path.resolve(PROJECT_ROOT, p);
+}
 
 const BOT_ABI = [
   "function liquidate((address collateralAsset,address debtAsset,address user,uint256 debtToCover,address swapRouter,uint24 poolFee,uint256 minCollateralOut,uint256 minDebtOutAfterSwap,bool useBalancer) params) external",
@@ -46,11 +70,8 @@ interface Opportunity {
 
 async function runPythonScanner(users: string[]): Promise<Opportunity[]> {
   return new Promise((resolve, reject) => {
-    const scannerPath = path.resolve(
-      __dirname,
-      "../../analyzer-python/src/scanner.py"
-    );
-    const cwd = path.resolve(__dirname, "../../analyzer-python");
+    const scannerPath = path.join(PROJECT_ROOT, "analyzer-python", "src", "scanner.py");
+    const cwd = path.join(PROJECT_ROOT, "analyzer-python");
 
     if (!fs.existsSync(scannerPath)) {
       reject(new Error(`Scanner not found at ${scannerPath}`));
@@ -74,24 +95,14 @@ async function runPythonScanner(users: string[]): Promise<Opportunity[]> {
 
     py.on("close", (code) => {
       if (code !== 0) {
-        reject(
-          new Error(`scanner exited ${code}: ${stderr || stdout || "no output"}`)
-        );
+        reject(new Error(`scanner exited ${code}: ${stderr || stdout || "no output"}`));
         return;
       }
       try {
         const parsed = JSON.parse(stdout);
-        if (Array.isArray(parsed)) {
-          resolve(parsed);
-        } else if (parsed && parsed.status === "no_users") {
-          resolve([]);
-        } else {
-          resolve([]);
-        }
+        resolve(Array.isArray(parsed) ? parsed : []);
       } catch (e: any) {
-        reject(
-          new Error(`Failed to parse scanner output: ${e.message}\nRaw: ${stdout}`)
-        );
+        reject(new Error(`Failed to parse scanner output: ${e.message}\nRaw: ${stdout}`));
       }
     });
 
@@ -116,15 +127,27 @@ async function main() {
 
   console.log("Executor wallet:", wallet.address);
   console.log("Bot contract  :", botAddress);
+  console.log("Project root  :", PROJECT_ROOT);
 
-  const usersPath =
-    process.env.USERS_FILE ||
-    path.resolve(__dirname, "../../shared/users.json");
+  const usersPath = resolveFromRoot(process.env.USERS_FILE, "shared/users.json");
+
+  // Fallback: legacy path under indexer-node/shared
+  const legacyPath = path.join(PROJECT_ROOT, "indexer-node", "shared", "users.json");
 
   let users: string[] = [];
+  let usedPath = usersPath;
+
   if (fs.existsSync(usersPath)) {
+    usedPath = usersPath;
+  } else if (fs.existsSync(legacyPath)) {
+    usedPath = legacyPath;
+    console.warn(`Using legacy users file: ${legacyPath}`);
+    console.warn(`Preferred location is: ${usersPath}`);
+  }
+
+  if (fs.existsSync(usedPath)) {
     try {
-      users = JSON.parse(fs.readFileSync(usersPath, "utf8"));
+      users = JSON.parse(fs.readFileSync(usedPath, "utf8"));
       if (!Array.isArray(users)) users = [];
     } catch {
       console.warn("users.json is invalid JSON – treating as empty");
@@ -132,12 +155,10 @@ async function main() {
     }
   } else {
     console.warn(`No users.json found at ${usersPath}`);
-    console.warn(
-      "Add borrower addresses to shared/users.json (JSON array of addresses)"
-    );
   }
 
-  // Filter out zero/placeholder addresses
+  console.log("Users file    :", usedPath);
+
   users = users.filter(
     (u) =>
       typeof u === "string" &&
@@ -151,9 +172,7 @@ async function main() {
 
   if (users.length === 0) {
     console.log("No real users to scan. Exiting cleanly.");
-    console.log(
-      "Tip: put Aave borrower addresses into shared/users.json and re-run."
-    );
+    console.log("Run the indexer first: cd indexer-node && npm run dev");
     return;
   }
 
@@ -169,9 +188,7 @@ async function main() {
 
   for (const opp of opps) {
     if (opp.estimated_profit_usd < Number(process.env.MIN_PROFIT_USD || "3")) {
-      console.log(
-        `Skip ${opp.user} – profit $${opp.estimated_profit_usd.toFixed(2)}`
-      );
+      console.log(`Skip ${opp.user} – profit $${opp.estimated_profit_usd.toFixed(2)}`);
       continue;
     }
 
@@ -199,10 +216,7 @@ async function main() {
       const receipt = await tx.wait();
       console.log("Confirmed in block", receipt?.blockNumber);
     } catch (err: any) {
-      console.error(
-        `Failed for ${opp.user}:`,
-        err.shortMessage || err.message
-      );
+      console.error(`Failed for ${opp.user}:`, err.shortMessage || err.message);
     }
   }
 
