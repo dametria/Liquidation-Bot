@@ -1,21 +1,9 @@
 /**
  * Aave V3 Borrower Event Indexer (production-hardened)
  *
- * Features:
- *  - Checkpointed backfill (resumes after crash)
- *  - Adaptive chunk size + fast-fail on eth_getLogs range limits (400)
- *  - Atomic users.json writes
- *  - WebSocket auto-reconnect with resubscribe
- *  - HTTP polling fallback when WS is unavailable
- *  - Graceful SIGINT / SIGTERM shutdown
- *  - Structured logging + basic metrics
- *
- * Usage:
- *   cd indexer-node && npm i && npm run dev
- *   npm run backfill
- *
- * Env:
- *   INDEXER_CHUNK_SIZE default 500 (safe for most Arbitrum public RPCs)
+ * If you see 400 Bad Request even on small chunks (e.g. 10–50 blocks),
+ * the RPC is rate-limiting or rejecting eth_getLogs. Switch to a paid
+ * endpoint (Alchemy, QuickNode, Infura, LlamaRPC, etc.).
  */
 
 import { config } from "dotenv";
@@ -41,8 +29,8 @@ const CHECKPOINT_FILE =
   path.resolve(__dirname, "../../shared/indexer-checkpoint.json");
 
 const LOOKBACK = Number(process.env.INDEXER_LOOKBACK_BLOCKS || "100000");
-// 500 is safe on most Arbitrum public endpoints; paid RPCs can raise this
 const INITIAL_CHUNK = Number(process.env.INDEXER_CHUNK_SIZE || "500");
+const MIN_CHUNK = Number(process.env.INDEXER_MIN_CHUNK || "10");
 const SAVE_EVERY = Number(process.env.INDEXER_SAVE_EVERY || "50");
 const POLL_INTERVAL_MS = Number(process.env.INDEXER_POLL_INTERVAL_MS || "12000");
 const MAX_RETRIES = Number(process.env.INDEXER_MAX_RETRIES || "8");
@@ -71,6 +59,7 @@ let lastProcessedBlock = 0;
 let shuttingDown = false;
 let totalEvents = 0;
 let liveMode: "ws" | "poll" | "none" = "none";
+let rateLimitStrikes = 0;
 
 function atomicWrite(filePath: string, data: string) {
   const dir = path.dirname(filePath);
@@ -171,7 +160,6 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/** True when the RPC is rejecting the log query range (retrying same range is useless). */
 function isRangeLimitError(err: any): boolean {
   const msg = String(err?.shortMessage || err?.message || err || "").toLowerCase();
   return (
@@ -184,7 +172,9 @@ function isRangeLimitError(err: any): boolean {
     msg.includes("exceed") ||
     msg.includes("too many") ||
     msg.includes("limit exceeded") ||
-    msg.includes("eth_getlogs") && msg.includes("limited")
+    msg.includes("rate limit") ||
+    msg.includes("429") ||
+    (msg.includes("eth_getlogs") && msg.includes("limited"))
   );
 }
 
@@ -199,7 +189,7 @@ async function withRetry<T>(
       return await fn();
     } catch (err: any) {
       lastErr = err;
-      // Range / size limit errors will never succeed on the same range
+      // Don't spin on range/rate-limit errors — caller will shrink or back off
       if (isRangeLimitError(err)) throw err;
       if (attempt === maxRetries) break;
       const delay = Math.min(30_000, 500 * Math.pow(2, attempt));
@@ -242,12 +232,18 @@ async function backfill(provider: ethers.Provider) {
     toBlock: latest,
     span: latest - fromBlock + 1,
     chunk: INITIAL_CHUNK,
+    rpc: RPC_URL.includes("arbitrum.io") ? "public-arbitrum (often rate-limits getLogs)" : "custom",
   });
+
+  if (RPC_URL.includes("arb1.arbitrum.io") || RPC_URL.includes("arbitrum.io/rpc")) {
+    log("warn", "Public Arbitrum RPC frequently returns 400 on eth_getLogs. Prefer Alchemy/QuickNode/LlamaRPC.", {
+      hint: "Set RPC_URL in .env to a paid or higher-limit endpoint",
+    });
+  }
 
   let chunk = INITIAL_CHUNK;
   let processed = 0;
   let start = fromBlock;
-  let consecutiveRangeFails = 0;
 
   while (start <= latest && !shuttingDown) {
     const end = Math.min(start + chunk - 1, latest);
@@ -255,7 +251,7 @@ async function backfill(provider: ethers.Provider) {
       const events = await withRetry(
         `queryFilter ${start}-${end}`,
         () => pool.queryFilter(pool.filters.Borrow(), start, end),
-        3
+        2
       );
 
       for (const ev of events) {
@@ -269,10 +265,9 @@ async function backfill(provider: ethers.Provider) {
       processed += events.length;
       totalEvents += events.length;
       saveCheckpoint(end);
-      consecutiveRangeFails = 0;
+      rateLimitStrikes = 0;
 
-      // Log periodically or on last chunk
-      if (end === latest || processed % 50 === 0 || end % 5000 < chunk) {
+      if (end === latest || processed % 50 === 0 || (end - fromBlock) % 5000 < chunk) {
         log("info", "Backfill progress", {
           from: start,
           to: end,
@@ -282,15 +277,44 @@ async function backfill(provider: ethers.Provider) {
         });
       }
 
-      // Cautious growth after successes (never above INITIAL_CHUNK)
       if (chunk < INITIAL_CHUNK) {
-        chunk = Math.min(INITIAL_CHUNK, Math.max(chunk + 50, Math.floor(chunk * 1.25)));
+        chunk = Math.min(INITIAL_CHUNK, Math.max(chunk + 25, Math.floor(chunk * 1.2)));
       }
 
       start = end + 1;
     } catch (err: any) {
       const msg = err.shortMessage || err.message || "";
       const rangeErr = isRangeLimitError(err);
+
+      if (rangeErr && chunk <= Math.max(MIN_CHUNK, 50)) {
+        // Tiny range still failing → rate limit / RPC ban, not range size
+        rateLimitStrikes++;
+        const backoff = Math.min(120_000, 5_000 * Math.pow(2, Math.min(rateLimitStrikes, 5)));
+        log("warn", "RPC rejecting even small getLogs ranges — backing off (likely rate limit)", {
+          start,
+          end,
+          chunk,
+          strike: rateLimitStrikes,
+          backoffMs: backoff,
+          error: msg,
+          tip: "Switch RPC_URL to Alchemy, QuickNode, Infura, or ankr",
+        });
+
+        if (rateLimitStrikes >= 8) {
+          log("error", "Too many rate-limit responses. Saving progress and exiting so you can change RPC.", {
+            lastProcessedBlock,
+            borrowers: borrowers.size,
+          });
+          saveUsers(true);
+          saveCheckpoint(lastProcessedBlock);
+          process.exit(2);
+        }
+
+        await sleep(backoff);
+        // Do not shrink below MIN_CHUNK; do not advance start
+        chunk = Math.max(MIN_CHUNK, Math.min(chunk, 50));
+        continue;
+      }
 
       log("warn", "Chunk failed, shrinking", {
         start,
@@ -300,26 +324,21 @@ async function backfill(provider: ethers.Provider) {
         error: msg,
       });
 
-      if (chunk <= 1) {
-        log("error", "Skipping single block after repeated failure", { block: start });
-        saveCheckpoint(start);
-        start += 1;
-        chunk = Math.max(10, Math.floor(INITIAL_CHUNK / 5));
-        consecutiveRangeFails = 0;
+      if (chunk <= MIN_CHUNK) {
+        log("error", "Skipping block range after repeated failure at min chunk", {
+          from: start,
+          to: end,
+        });
+        saveCheckpoint(end);
+        start = end + 1;
+        chunk = Math.max(MIN_CHUNK, Math.floor(INITIAL_CHUNK / 5));
+        await sleep(2000);
       } else {
-        // Aggressive shrink on 400/range errors
         chunk = rangeErr
-          ? Math.max(1, Math.floor(chunk / 4))
-          : Math.max(1, Math.floor(chunk / 2));
-        consecutiveRangeFails = rangeErr ? consecutiveRangeFails + 1 : 0;
-
-        // If we keep hitting range limits, force a very small chunk
-        if (consecutiveRangeFails >= 3) {
-          chunk = Math.min(chunk, 100);
-          log("info", "Forcing small chunk after repeated range limits", { chunk });
-        }
+          ? Math.max(MIN_CHUNK, Math.floor(chunk / 4))
+          : Math.max(MIN_CHUNK, Math.floor(chunk / 2));
+        await sleep(rangeErr ? 500 : 1000);
       }
-      await sleep(rangeErr ? 200 : 1000);
     }
   }
 
@@ -398,13 +417,14 @@ async function startWsLive() {
   await attach();
 
   const http = createHttpProvider();
+  const catchChunk = Math.min(INITIAL_CHUNK, 200);
   setInterval(async () => {
     if (shuttingDown) return;
     try {
       const latest = await http.getBlockNumber();
       if (latest <= lastProcessedBlock) return;
       const from = lastProcessedBlock + 1;
-      const to = Math.min(latest, from + Math.min(INITIAL_CHUNK, 500) - 1);
+      const to = Math.min(latest, from + catchChunk - 1);
       const catchPool = new ethers.Contract(AAVE_POOL, POOL_ABI, http);
       const events = await catchPool.queryFilter(catchPool.filters.Borrow(), from, to);
       for (const ev of events) {
@@ -431,7 +451,7 @@ async function startHttpPolling() {
 
   const provider = createHttpProvider();
   const pool = new ethers.Contract(AAVE_POOL, POOL_ABI, provider);
-  const pollChunk = Math.min(INITIAL_CHUNK, 500);
+  const pollChunk = Math.min(INITIAL_CHUNK, 200);
 
   const tick = async () => {
     if (shuttingDown) return;
