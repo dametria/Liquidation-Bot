@@ -1,10 +1,5 @@
 /**
  * Aave V3 Borrower Event Indexer (production-hardened)
- *
- * .env is loaded from (first found):
- *   1) process.cwd()/.env
- *   2) project root (../.env from indexer-node)
- *   3) ../../.env from src/
  */
 
 import { config } from "dotenv";
@@ -16,7 +11,6 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ─── Load .env from several likely locations ──────────────────
 const envCandidates = [
   path.resolve(process.cwd(), ".env"),
   path.resolve(process.cwd(), "../.env"),
@@ -35,24 +29,26 @@ for (const p of envCandidates) {
     }
   }
 }
-if (!loadedEnvPath) {
-  config(); // fallback: default dotenv behavior
-}
+if (!loadedEnvPath) config();
 
 const RPC_URL = (process.env.RPC_URL || "https://arb1.arbitrum.io/rpc").trim();
 const AAVE_POOL = ethers.getAddress(
   (process.env.AAVE_POOL || "0x794a61358D6845594F94dc1DB02A252b5b4814aD").trim()
 );
-const USERS_FILE =
+
+// Prefer cwd-relative shared/ so the file is easy to find from project root
+const USERS_FILE = path.resolve(
   process.env.USERS_FILE ||
-  path.resolve(__dirname, "../../shared/users.json");
-const CHECKPOINT_FILE =
+    path.resolve(process.cwd(), "../shared/users.json")
+);
+const CHECKPOINT_FILE = path.resolve(
   process.env.INDEXER_CHECKPOINT_FILE ||
-  path.resolve(__dirname, "../../shared/indexer-checkpoint.json");
+    path.resolve(process.cwd(), "../shared/indexer-checkpoint.json")
+);
 
 const LOOKBACK = Number(process.env.INDEXER_LOOKBACK_BLOCKS || "100000");
-const INITIAL_CHUNK = Number(process.env.INDEXER_CHUNK_SIZE || "500");
-const MIN_CHUNK = Number(process.env.INDEXER_MIN_CHUNK || "10");
+const INITIAL_CHUNK = Number(process.env.INDEXER_CHUNK_SIZE || "10");
+const MIN_CHUNK = Number(process.env.INDEXER_MIN_CHUNK || "1");
 const SAVE_EVERY = Number(process.env.INDEXER_SAVE_EVERY || "50");
 const POLL_INTERVAL_MS = Number(process.env.INDEXER_POLL_INTERVAL_MS || "12000");
 const MAX_RETRIES = Number(process.env.INDEXER_MAX_RETRIES || "8");
@@ -133,6 +129,7 @@ function loadExisting() {
     borrowers: borrowers.size,
     lastProcessedBlock,
     usersFile: USERS_FILE,
+    checkpointFile: CHECKPOINT_FILE,
   });
 }
 
@@ -144,9 +141,15 @@ function saveUsers(force = false) {
     atomicWrite(USERS_FILE, JSON.stringify(list, null, 2) + "\n");
     dirtyCount = 0;
     lastSave = Date.now();
-    log("debug", "Saved users", { count: list.length });
+    log("info", "Saved users.json", {
+      count: list.length,
+      path: USERS_FILE,
+    });
   } catch (e: any) {
-    log("error", "Failed to save users.json", { error: e.message });
+    log("error", "Failed to save users.json", {
+      error: e.message,
+      path: USERS_FILE,
+    });
   }
 }
 
@@ -183,6 +186,15 @@ function addBorrower(addr: string | undefined | null) {
   } catch {
     /* invalid */
   }
+}
+
+/** Pull borrower addresses from an ethers v6 event (Result or plain object). */
+function extractBorrowersFromEvent(ev: any) {
+  const args = ev?.args;
+  if (!args) return;
+  // Named access
+  addBorrower(args.onBehalfOf ?? args[2]);
+  addBorrower(args.user ?? args[1]);
 }
 
 function sleep(ms: number) {
@@ -252,6 +264,7 @@ async function backfill(provider: ethers.Provider) {
 
   if (fromBlock > latest) {
     log("info", "Already up to date", { lastProcessedBlock, latest });
+    saveUsers(true);
     return latest;
   }
 
@@ -260,11 +273,8 @@ async function backfill(provider: ethers.Provider) {
     toBlock: latest,
     span: latest - fromBlock + 1,
     chunk: INITIAL_CHUNK,
+    usersFile: USERS_FILE,
   });
-
-  if (RPC_URL.includes("arb1.arbitrum.io") || RPC_URL.includes("arbitrum.io/rpc")) {
-    log("warn", "Still using public Arbitrum RPC — eth_getLogs often returns 400. Set RPC_URL to Alchemy/QuickNode.");
-  }
 
   let chunk = INITIAL_CHUNK;
   let processed = 0;
@@ -280,11 +290,7 @@ async function backfill(provider: ethers.Provider) {
       );
 
       for (const ev of events) {
-        const args = (ev as any).args;
-        if (args) {
-          addBorrower(args.onBehalfOf);
-          addBorrower(args.user);
-        }
+        extractBorrowersFromEvent(ev);
       }
 
       processed += events.length;
@@ -292,7 +298,7 @@ async function backfill(provider: ethers.Provider) {
       saveCheckpoint(end);
       rateLimitStrikes = 0;
 
-      if (end === latest || processed % 50 === 0 || (end - fromBlock) % 5000 < chunk) {
+      if (end === latest || processed % 50 === 0 || events.length > 0) {
         log("info", "Backfill progress", {
           from: start,
           to: end,
@@ -303,7 +309,7 @@ async function backfill(provider: ethers.Provider) {
       }
 
       if (chunk < INITIAL_CHUNK) {
-        chunk = Math.min(INITIAL_CHUNK, Math.max(chunk + 25, Math.floor(chunk * 1.2)));
+        chunk = Math.min(INITIAL_CHUNK, Math.max(chunk + 1, Math.floor(chunk * 1.2)));
       }
 
       start = end + 1;
@@ -311,32 +317,28 @@ async function backfill(provider: ethers.Provider) {
       const msg = err.shortMessage || err.message || "";
       const rangeErr = isRangeLimitError(err);
 
-      if (rangeErr && chunk <= Math.max(MIN_CHUNK, 50)) {
+      if (rangeErr && chunk <= Math.max(MIN_CHUNK, 10)) {
         rateLimitStrikes++;
-        const backoff = Math.min(120_000, 5_000 * Math.pow(2, Math.min(rateLimitStrikes, 5)));
-        log("warn", "RPC rejecting small getLogs ranges — backing off", {
+        const backoff = Math.min(60_000, 3_000 * Math.pow(2, Math.min(rateLimitStrikes, 4)));
+        log("warn", "RPC rejecting getLogs — backing off", {
           start,
           end,
           chunk,
           strike: rateLimitStrikes,
           backoffMs: backoff,
           error: msg,
-          rpc: redactRpc(RPC_URL),
-          tip: "Confirm .env RPC_URL is loaded (see startup log envFile)",
         });
-
-        if (rateLimitStrikes >= 8) {
-          log("error", "Too many rate-limit responses. Saving and exiting.", {
+        if (rateLimitStrikes >= 10) {
+          log("error", "Too many RPC errors. Saving and exiting.", {
             lastProcessedBlock,
             borrowers: borrowers.size,
+            usersFile: USERS_FILE,
           });
           saveUsers(true);
-          saveCheckpoint(lastProcessedBlock);
           process.exit(2);
         }
-
         await sleep(backoff);
-        chunk = Math.max(MIN_CHUNK, Math.min(chunk, 50));
+        chunk = Math.max(MIN_CHUNK, Math.min(chunk, 10));
         continue;
       }
 
@@ -349,19 +351,13 @@ async function backfill(provider: ethers.Provider) {
       });
 
       if (chunk <= MIN_CHUNK) {
-        log("error", "Skipping block range after repeated failure at min chunk", {
-          from: start,
-          to: end,
-        });
         saveCheckpoint(end);
         start = end + 1;
-        chunk = Math.max(MIN_CHUNK, Math.floor(INITIAL_CHUNK / 5));
-        await sleep(2000);
+        chunk = Math.max(MIN_CHUNK, 5);
+        await sleep(1000);
       } else {
-        chunk = rangeErr
-          ? Math.max(MIN_CHUNK, Math.floor(chunk / 4))
-          : Math.max(MIN_CHUNK, Math.floor(chunk / 2));
-        await sleep(rangeErr ? 500 : 1000);
+        chunk = Math.max(MIN_CHUNK, Math.floor(chunk / 2));
+        await sleep(300);
       }
     }
   }
@@ -371,6 +367,7 @@ async function backfill(provider: ethers.Provider) {
     unique: borrowers.size,
     events: processed,
     lastProcessedBlock,
+    usersFile: USERS_FILE,
   });
   return latest;
 }
@@ -384,7 +381,6 @@ async function startWsLive() {
 
   const attach = async () => {
     if (shuttingDown) return;
-
     if (wsProvider) {
       try {
         await wsProvider.destroy();
@@ -401,7 +397,7 @@ async function startWsLive() {
       addBorrower(user);
       totalEvents++;
       log("info", "Borrow", { user: onBehalfOf, unique: borrowers.size });
-      saveUsers();
+      saveUsers(true);
     });
     pool.on(pool.filters.Repay(), (_r, user) => addBorrower(user));
     pool.on(pool.filters.LiquidationCall(), (_c, _d, user) => addBorrower(user));
@@ -417,19 +413,14 @@ async function startWsLive() {
       });
     }
 
-    wsProvider.on("error", (err) => {
-      log("warn", "Provider error", { error: String(err) });
-    });
-
     reconnectAttempt = 0;
-    log("info", "WebSocket subscribed to Borrow/Repay/LiquidationCall");
+    log("info", "WebSocket subscribed");
   };
 
   const scheduleReconnect = () => {
     if (shuttingDown) return;
     reconnectAttempt++;
     const delay = Math.min(60_000, 1000 * Math.pow(2, reconnectAttempt));
-    log("info", "Reconnecting WebSocket", { attempt: reconnectAttempt, delayMs: delay });
     setTimeout(() => {
       attach().catch((e) => {
         log("error", "Reconnect failed", { error: e.message });
@@ -441,7 +432,7 @@ async function startWsLive() {
   await attach();
 
   const http = createHttpProvider();
-  const catchChunk = Math.min(INITIAL_CHUNK, 200);
+  const catchChunk = Math.min(INITIAL_CHUNK, 10);
   setInterval(async () => {
     if (shuttingDown) return;
     try {
@@ -451,20 +442,14 @@ async function startWsLive() {
       const to = Math.min(latest, from + catchChunk - 1);
       const catchPool = new ethers.Contract(AAVE_POOL, POOL_ABI, http);
       const events = await catchPool.queryFilter(catchPool.filters.Borrow(), from, to);
-      for (const ev of events) {
-        const args = (ev as any).args;
-        if (args) {
-          addBorrower(args.onBehalfOf);
-          addBorrower(args.user);
-        }
-      }
+      for (const ev of events) extractBorrowersFromEvent(ev);
       if (events.length > 0) {
         log("info", "WS catch-up", { from, to, events: events.length });
-        saveUsers();
+        saveUsers(true);
       }
       saveCheckpoint(to);
     } catch (e: any) {
-      log("debug", "Catch-up poll failed", { error: e.message });
+      log("debug", "Catch-up failed", { error: e.message });
     }
   }, Math.max(POLL_INTERVAL_MS, 15_000));
 }
@@ -475,7 +460,7 @@ async function startHttpPolling() {
 
   const provider = createHttpProvider();
   const pool = new ethers.Contract(AAVE_POOL, POOL_ABI, provider);
-  const pollChunk = Math.min(INITIAL_CHUNK, 200);
+  const pollChunk = Math.min(INITIAL_CHUNK, 10);
 
   const tick = async () => {
     if (shuttingDown) return;
@@ -490,13 +475,7 @@ async function startHttpPolling() {
         pool.queryFilter(pool.filters.Borrow(), from, to)
       );
 
-      for (const ev of events) {
-        const args = (ev as any).args;
-        if (args) {
-          addBorrower(args.onBehalfOf);
-          addBorrower(args.user);
-        }
-      }
+      for (const ev of events) extractBorrowersFromEvent(ev);
 
       if (events.length > 0) {
         totalEvents += events.length;
@@ -506,7 +485,7 @@ async function startHttpPolling() {
           events: events.length,
           unique: borrowers.size,
         });
-        saveUsers();
+        saveUsers(true);
       }
 
       saveCheckpoint(to);
@@ -531,6 +510,7 @@ function setupShutdown() {
       totalEvents,
       lastProcessedBlock,
       liveMode,
+      usersFile: USERS_FILE,
     });
     process.exit(0);
   };
@@ -542,22 +522,15 @@ async function main() {
   setupShutdown();
 
   log("info", "Aave V3 Borrower Indexer starting", {
-    envFile: loadedEnvPath || "(none found — using process.env / defaults)",
+    envFile: loadedEnvPath || "(none found)",
     rpc: redactRpc(RPC_URL),
     pool: AAVE_POOL,
     lookback: LOOKBACK,
     chunk: INITIAL_CHUNK,
     backfillOnly: BACKFILL_ONLY,
     cwd: process.cwd(),
+    usersFile: USERS_FILE,
   });
-
-  if (!loadedEnvPath) {
-    log("warn", "No .env file found. Put RPC_URL in project-root .env or export it in the shell.");
-  }
-
-  if (RPC_URL.includes("arbitrum.io")) {
-    log("warn", "RPC still looks like the public endpoint. Your Alchemy URL may not be loaded.");
-  }
 
   loadExisting();
 
@@ -565,7 +538,10 @@ async function main() {
   await backfill(httpProvider);
 
   if (BACKFILL_ONLY) {
-    log("info", "Backfill-only complete, exiting");
+    log("info", "Backfill-only complete, exiting", {
+      usersFile: USERS_FILE,
+      unique: borrowers.size,
+    });
     process.exit(0);
   }
 
@@ -577,6 +553,7 @@ async function main() {
       await startHttpPolling();
     }
   } else {
+    log("info", "RPC is HTTP — using polling (use wss:// URL for WebSocket)");
     await startHttpPolling();
   }
 
@@ -587,6 +564,7 @@ async function main() {
       totalEvents,
       lastProcessedBlock,
       liveMode,
+      usersFile: USERS_FILE,
     });
   }, 60_000);
 }
