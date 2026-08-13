@@ -40,8 +40,8 @@ interface Opportunity {
 
 async function runPythonScanner(users: string[]): Promise<Opportunity[]> {
   return new Promise((resolve, reject) => {
-    const py = spawn("python3", ["src/scanner.py"], {
-      cwd: path.resolve(__dirname, "../../analyzer-python"),
+    const py = spawn("python3", ["../src/scanner.py"], {
+      cwd: path.resolve("analyzer-python"),
       env: { ...process.env },
     });
     let stdout = "";
@@ -83,7 +83,7 @@ async function main() {
   console.log("Bot contract  :", botAddress);
 
   const usersPath =
-    process.env.USERS_FILE || path.resolve(__dirname, "../../shared/users.json");
+    process.env.USERS_FILE || path.resolve("shared/users.json");
   let users: string[] = [];
   if (fs.existsSync(usersPath)) {
     users = JSON.parse(fs.readFileSync(usersPath, "utf8"));
