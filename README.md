@@ -2,29 +2,28 @@
 
 Capital-efficient liquidation bot that:
 
-1. Scans Aave V3 positions for **health factor < 1**
-2. Borrows the debt asset via **Balancer V2 flash loan (0 % fee)** or **Aave V3 flashLoanSimple**
-3. Calls `liquidationCall`, receives collateral + liquidation bonus
-4. Swaps collateral → debt asset on Uniswap V3
-5. Repays the flash loan
-6. Sends remaining profit to the **deployer wallet**
+1. **Indexes** Aave V3 borrowers via on-chain events
+2. Scans those positions for **health factor < 1**
+3. Borrows the debt asset via **Balancer V2 flash loan (0 % fee)** or **Aave V3 flashLoanSimple**
+4. Calls `liquidationCall`, receives collateral + liquidation bonus
+5. Swaps collateral → debt asset on Uniswap V3
+6. Repays the flash loan
+7. Sends remaining profit to the **deployer wallet**
 
-All steps are atomic in a single transaction. Only gas is required.
+All liquidation steps are atomic in a single transaction. Only gas is required.
 
 ## Layout
 
 ```
 Liquidation-Bot/
-├── contracts/                  # Foundry
-│   ├── src/LiquidationBot.sol  # Core executor
-│   ├── script/Deploy.s.sol
-│   ├── foundry.toml
-│   └── remappings.txt
-├── analyzer-python/
-│   └── src/scanner.py          # HF checks + profit estimate
-├── executor-node/
-│   └── src/index.ts            # Simulation + submission
-├── shared/users.json
+├── contracts/                  # Foundry – LiquidationBot.sol
+├── indexer-node/               # Event indexer (backfill + live)
+│   └── src/indexer.ts
+├── analyzer-python/            # HF scanner + profit estimate
+│   └── src/scanner.py
+├── executor-node/              # Simulation + tx submission
+│   └── src/index.ts
+├── shared/users.json           # Populated by the indexer
 ├── .env.example
 └── README.md
 ```
@@ -34,92 +33,111 @@ Liquidation-Bot/
 ### 1. Install tools
 
 ```bash
-# Foundry
-curl -L https://foundry.paradigm.xyz | bash
-foundryup
+curl -L https://foundry.paradigm.xyz | bash && foundryup
 
-# Node
 cd executor-node && npm i && cd ..
-
-# Python
+cd indexer-node && npm i && cd ..
 cd analyzer-python && pip install -r requirements.txt && cd ..
 ```
 
-### 2. Install Solidity dependencies (required)
+### 2. Install Solidity dependencies
 
 ```bash
 cd contracts
-
-# Install the three libraries the contract needs
 forge install foundry-rs/forge-std OpenZeppelin/openzeppelin-contracts aave/aave-v3-core --no-commit
-
-# Verify the Aave interface is present
-ls lib/aave-v3-core/contracts/flashloan/interfaces/IFlashLoanSimpleReceiver.sol
+forge build
 ```
-
-If the `ls` command succeeds, the import error is fixed.
 
 ### 3. Config
 
 ```bash
 cp .env.example .env
-# Edit PRIVATE_KEY, RPC_URL, AAVE_ADDRESSES_PROVIDER, BALANCER_VAULT
+# set PRIVATE_KEY, RPC_URL, AAVE_*, LIQUIDATION_BOT (after deploy)
 ```
 
-### 4. Build & Deploy
+### 4. Deploy the contract
 
 ```bash
 cd contracts
-forge build          # should succeed after the install step above
+export PRIVATE_KEY=0x...
+export AAVE_ADDRESSES_PROVIDER=0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb
+export BALANCER_VAULT=0xBA12222222228d8Ba445958a75a0704d566BF2C8
+export RPC_URL=https://arb1.arbitrum.io/rpc
 
 forge script script/Deploy.s.sol:Deploy \
-  --rpc-url $RPC_URL \
-  --broadcast \
-  --private-key $PRIVATE_KEY \
-  -vvvv
+  --rpc-url $RPC_URL --broadcast --private-key $PRIVATE_KEY -vvvv
 ```
 
-Copy the printed `LiquidationBot` address into `.env` as `LIQUIDATION_BOT`.
+Copy the printed address into `.env` as `LIQUIDATION_BOT`.
 
-### 5. Run the bot
+### 5. Index borrowers (run this first / leave running)
 
 ```bash
-cd executor-node && npm run dev
+cd indexer-node
+npm run dev
 ```
 
-## Common error
+This will:
+- Backfill recent `Borrow` events (default last ~50k blocks)
+- Write addresses to `shared/users.json`
+- Keep listening for new borrows live
 
-```
-Source "@aave/core-v3/contracts/flashloan/interfaces/IFlashLoanSimpleReceiver.sol" not found
+One-shot backfill only:
+
+```bash
+npm run backfill
 ```
 
-→ You skipped the `forge install ... aave/aave-v3-core` step. Run it from the `contracts/` directory.
+### 6. Run the liquidation cycle
 
-## Flow
+```bash
+cd executor-node
+npm run dev
+```
 
+The executor reads `shared/users.json`, asks the Python scanner for opportunities (HF < 1 + min profit), simulates, then submits.
+
+## Indexer details
+
+| Setting | Env var | Default |
+|---------|---------|--------|
+| Lookback blocks | `INDEXER_LOOKBACK_BLOCKS` | 50000 |
+| Save every N new addresses | `INDEXER_SAVE_EVERY` | 25 |
+| Users file | `USERS_FILE` | `./shared/users.json` |
+| Pool | `AAVE_POOL` | Arbitrum V3 Pool |
+
+For faster live updates use a **WebSocket** RPC:
+
+```bash
+RPC_URL=wss://arb-mainnet.g.alchemy.com/v2/YOUR_KEY
 ```
-Owner → liquidate(params)
-         │
-         ▼
-   Balancer.flashLoan  (or Aave.flashLoanSimple)
-         │
-         ▼
-   receiveFlashLoan / executeOperation
-         │
-         ├─ approve Pool
-         ├─ Pool.liquidationCall(...)
-         ├─ receive collateral (+ bonus)
-         ├─ Uniswap V3 exactInputSingle
-         ├─ repay flash loan
-         └─ transfer leftover debtAsset → DEPLOYER
+
+## Common errors
+
+**`@aave/core-v3/... not found`**
+
+```bash
+cd contracts
+forge install aave/aave-v3-core --no-commit
 ```
+
+**`vm.envUint: environment variable "PRIVATE_KEY" not found`**
+
+```bash
+export PRIVATE_KEY=0x...
+export AAVE_ADDRESSES_PROVIDER=...
+export BALANCER_VAULT=...
+```
+
+**`No users.json` / Scanning 0 users**
+
+Run the indexer first so it populates `shared/users.json`.
 
 ## Security
 
 - Keys only in `.env` (gitignored)
 - Only owner can trigger liquidations
-- `minProfitWei` check inside callback
-- Routers must be approved
+- `minProfitWei` / off-chain `$3` filter
 - Always simulate before broadcasting
 - Prefer Balancer (0 % fee) when liquidity allows
 
