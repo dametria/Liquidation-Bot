@@ -99,6 +99,16 @@ npm run dev
 
 The executor reads `shared/users.json`, asks the Python scanner for opportunities (HF < 1 + min profit), simulates, then submits.
 
+## Analyzer (exact LiquidationLogic math)
+
+```bash
+cd analyzer-python
+pip install -r requirements.txt pytest
+PYTHONPATH=src pytest tests/ -q   # 28 tests
+```
+
+The scanner uses `aave_v3_liquidation_math.compute_liquidation_amounts` for close-factor, dust prevention, and protocol-fee sizing before profit filtering.
+
 ## Indexer details
 
 | Setting | Env var | Default |
