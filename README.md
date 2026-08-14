@@ -20,7 +20,9 @@ Liquidation-Bot/
 ├── indexer-node/               # Event indexer (backfill + live)
 │   └── src/indexer.ts
 ├── analyzer-python/            # HF scanner + profit estimate
-│   └── src/scanner.py
+│   ├── src/scanner.py
+│   ├── src/aave_v3_liquidation_math.py   # exact LiquidationLogic math
+│   └── tests/
 ├── executor-node/              # Simulation + tx submission
 │   └── src/index.ts
 ├── shared/users.json           # Populated by the indexer

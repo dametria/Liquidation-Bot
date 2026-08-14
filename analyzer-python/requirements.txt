@@ -1,3 +1,6 @@
 web3>=6.15.0
 eth-abi>=5.0.0
 python-dotenv>=1.0.0
+
+# dev / tests
+# pytest>=8.0
